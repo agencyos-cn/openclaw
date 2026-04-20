@@ -20,6 +20,8 @@ import {
   activateSecretsRuntimeSnapshot,
   prepareSecretsRuntimeSnapshot,
 } from "../secrets/runtime.js";
+import { resolveGatewayAuth } from "./auth.js";
+import { assertGatewayAuthNotKnownWeak } from "./known-weak-gateway-secrets.js";
 import {
   ensureGatewayStartupAuth,
   mergeGatewayAuthConfig,
@@ -38,6 +40,9 @@ export type ActivateRuntimeSecrets = (
   config: OpenClawConfig,
   params: { reason: "startup" | "reload" | "restart-check"; activate: boolean },
 ) => Promise<Awaited<ReturnType<typeof prepareSecretsRuntimeSnapshot>>>;
+
+type PrepareRuntimeSecretsSnapshot = typeof prepareSecretsRuntimeSnapshot;
+type ActivateRuntimeSecretsSnapshot = typeof activateSecretsRuntimeSnapshot;
 
 type GatewayStartupConfigOverrides = {
   auth?: GatewayAuthConfig;
@@ -86,9 +91,15 @@ export function createRuntimeSecretsActivator(params: {
     message: string,
     cfg: OpenClawConfig,
   ) => void;
+  prepareRuntimeSecretsSnapshot?: PrepareRuntimeSecretsSnapshot;
+  activateRuntimeSecretsSnapshot?: ActivateRuntimeSecretsSnapshot;
 }): ActivateRuntimeSecrets {
   let secretsDegraded = false;
   let secretsActivationTail: Promise<void> = Promise.resolve();
+  const prepareRuntimeSecretsSnapshot =
+    params.prepareRuntimeSecretsSnapshot ?? prepareSecretsRuntimeSnapshot;
+  const activateRuntimeSecretsSnapshot =
+    params.activateRuntimeSecretsSnapshot ?? activateSecretsRuntimeSnapshot;
 
   const runWithSecretsActivationLock = async <T>(operation: () => Promise<T>): Promise<T> => {
     const run = secretsActivationTail.then(operation, operation);
@@ -102,11 +113,12 @@ export function createRuntimeSecretsActivator(params: {
   return async (config, activationParams) =>
     await runWithSecretsActivationLock(async () => {
       try {
-        const prepared = await prepareSecretsRuntimeSnapshot({
+        const prepared = await prepareRuntimeSecretsSnapshot({
           config: pruneSkippedStartupSecretSurfaces(config),
         });
+        assertRuntimeGatewayAuthNotKnownWeak(prepared.config);
         if (activationParams.activate) {
-          activateSecretsRuntimeSnapshot(prepared);
+          activateRuntimeSecretsSnapshot(prepared);
           logGatewayAuthSurfaceDiagnostics(prepared, params.logSecrets);
         }
         for (const warning of prepared.warnings) {
@@ -230,6 +242,16 @@ function pruneSkippedStartupSecretSurfaces(config: OpenClawConfig): OpenClawConf
     ...config,
     channels: undefined,
   };
+}
+
+function assertRuntimeGatewayAuthNotKnownWeak(config: OpenClawConfig): void {
+  assertGatewayAuthNotKnownWeak(
+    resolveGatewayAuth({
+      authConfig: config.gateway?.auth,
+      env: process.env,
+      tailscaleMode: config.gateway?.tailscale?.mode ?? "off",
+    }),
+  );
 }
 
 function logGatewayAuthSurfaceDiagnostics(
