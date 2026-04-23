@@ -1,8 +1,10 @@
 export const EXPECTED_CODEX_MODELS_COMMAND_TEXT = [
   "Codex models:",
   "Available Codex models",
+  "Available models, local cache:",
   "Available agent target:",
   "Available agent targets:",
+  "Available agent IDs in this session:",
   "opened an interactive trust prompt",
   "opened an interactive model-selection prompt",
   "running as Codex on `codex/",
@@ -13,6 +15,7 @@ export const EXPECTED_CODEX_MODELS_COMMAND_TEXT = [
   "`codex models` failed in this sandbox",
   "`codex models` could not be run in this sandbox.",
   "`codex models` is not runnable in this sandboxed session.",
+  "`codex` is not installed on the shell PATH in this environment.",
   "`codex models` didn’t return a plain list in this environment",
   "I couldn’t get a direct `codex models` CLI listing because the local sandbox blocked that command.",
   "I couldn’t list all installed/available Codex models from the local CLI because the sandboxed `codex` command failed to start in this environment.",
@@ -38,6 +41,7 @@ export const EXPECTED_CODEX_MODELS_COMMAND_TEXT = [
   "This harness is configured with a single Codex model: `codex/",
   "Primary model: `codex/",
   "Registered models: `codex/",
+  "Active model: `codex/",
   "Current active model is `codex/",
   "Current OpenClaw session status reports the active model as:",
 ] as const;
@@ -56,6 +60,12 @@ export function isExpectedCodexModelsCommandText(text: string): boolean {
       normalized.includes("fails to start") ||
       normalized.includes("repo-local fallback") ||
       normalized.includes("sandbox blocks") ||
+      ((normalized.includes("rejected") || normalized.includes("not approved")) &&
+        (normalized.includes("sandbox") ||
+          normalized.includes("permission") ||
+          normalized.includes("permissions") ||
+          normalized.includes("escalation") ||
+          normalized.includes("elevated execution"))) ||
       normalized.includes("interactive in this environment") ||
       normalized.includes("sandboxed session") ||
       normalized.includes("required user namespace") ||
@@ -89,7 +99,8 @@ export function isExpectedCodexModelsCommandText(text: string): boolean {
     normalized.includes("interactive tui");
   const mentionsVisibleOptions =
     normalized.includes("visible options in this session:") ||
-    normalized.includes("visible options:");
+    normalized.includes("visible options:") ||
+    normalized.includes("available agent ids in this session:");
   const mentionsCurrentActiveModel =
     normalized.includes("current active model is `codex/") ||
     normalized.includes("current active model is codex/");
@@ -101,6 +112,8 @@ export function isExpectedCodexModelsCommandText(text: string): boolean {
     mentionsInteractiveSelection &&
     mentionsVisibleOptions &&
     mentionsCurrentActiveModel;
+  const isAgentIdModelSummary =
+    normalized.includes("available agent ids in this session:") && text.includes("`codex/");
   const isInteractiveTuiSummary =
     mentionsCodexModelsCommand &&
     mentionsInteractiveSelection &&
@@ -111,6 +124,7 @@ export function isExpectedCodexModelsCommandText(text: string): boolean {
     isSandboxFallback ||
     isSessionConfigFallback ||
     isInteractiveSelectionSummary ||
+    isAgentIdModelSummary ||
     isInteractiveTuiSummary
   );
 }

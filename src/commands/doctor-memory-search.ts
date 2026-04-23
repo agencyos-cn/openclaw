@@ -4,8 +4,13 @@ import {
   resolveAgentWorkspaceDir,
   resolveDefaultAgentId,
 } from "../agents/agent-scope.js";
+import { hasAnyAuthProfileStoreSource } from "../agents/auth-profiles.js";
 import { resolveMemorySearchConfig } from "../agents/memory-search.js";
-import { resolveApiKeyForProvider } from "../agents/model-auth.js";
+import {
+  resolveApiKeyForProvider,
+  resolveEnvApiKey,
+  resolveUsableCustomProviderApiKey,
+} from "../agents/model-auth.js";
 import { formatCliCommand } from "../cli/command-format.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { formatErrorMessage } from "../infra/errors.js";
@@ -15,8 +20,6 @@ import { hasConfiguredMemorySecretInput } from "../memory-host-sdk/secret.js";
 import {
   auditDreamingArtifacts,
   auditShortTermPromotionArtifacts,
-  getBuiltinMemoryEmbeddingProviderDoctorMetadata,
-  listBuiltinAutoSelectMemoryEmbeddingProviderDoctorMetadata,
   repairDreamingArtifacts,
   repairShortTermPromotionArtifacts,
   type DreamingArtifactsAuditSummary,
@@ -26,17 +29,17 @@ import {
   getActiveMemorySearchManager,
   resolveActiveMemoryBackendConfig,
 } from "../plugins/memory-runtime.js";
+import { getProviderEnvVars } from "../secrets/provider-env-vars.js";
 import { normalizeOptionalString } from "../shared/string-coerce.js";
 import { note } from "../terminal/note.js";
 import { resolveUserPath } from "../utils.js";
 import type { DoctorPrompter } from "./doctor-prompter.js";
+import {
+  detectRootMemoryFiles,
+  formatRootMemoryFilesWarning,
+  migrateLegacyRootMemoryFile,
+} from "./doctor-workspace.js";
 import { isRecord } from "./doctor/shared/legacy-config-record-shared.js";
-
-function resolveSuggestedRemoteMemoryProvider(): string | undefined {
-  return listBuiltinAutoSelectMemoryEmbeddingProviderDoctorMetadata().find(
-    (provider) => provider.transport === "remote",
-  )?.providerId;
-}
 
 type RuntimeMemoryAuditContext = {
   workspaceDir?: string;
@@ -44,6 +47,90 @@ type RuntimeMemoryAuditContext = {
   dbPath?: string;
   qmdCollections?: number;
 };
+
+type MemoryEmbeddingProviderDoctorMetadata = {
+  providerId: string;
+  authProviderId: string;
+  transport: "local" | "remote";
+  autoSelectPriority?: number;
+};
+
+const BUNDLED_MEMORY_EMBEDDING_PROVIDER_DOCTOR_METADATA: MemoryEmbeddingProviderDoctorMetadata[] = [
+  {
+    providerId: "github-copilot",
+    authProviderId: "github-copilot",
+    transport: "remote",
+    autoSelectPriority: 15,
+  },
+  {
+    providerId: "openai",
+    authProviderId: "openai",
+    transport: "remote",
+    autoSelectPriority: 20,
+  },
+  {
+    providerId: "gemini",
+    authProviderId: "google",
+    transport: "remote",
+    autoSelectPriority: 30,
+  },
+  {
+    providerId: "voyage",
+    authProviderId: "voyage",
+    transport: "remote",
+    autoSelectPriority: 40,
+  },
+  {
+    providerId: "mistral",
+    authProviderId: "mistral",
+    transport: "remote",
+    autoSelectPriority: 50,
+  },
+  {
+    providerId: "bedrock",
+    authProviderId: "amazon-bedrock",
+    transport: "remote",
+    autoSelectPriority: 60,
+  },
+];
+
+function resolveMemoryEmbeddingProviderDoctorMetadata(
+  providerId: string,
+): (MemoryEmbeddingProviderDoctorMetadata & { envVars: string[] }) | null {
+  const metadata =
+    BUNDLED_MEMORY_EMBEDDING_PROVIDER_DOCTOR_METADATA.find(
+      (candidate) => candidate.providerId === providerId,
+    ) ?? null;
+  if (!metadata) {
+    return null;
+  }
+  return {
+    ...metadata,
+    envVars: getProviderEnvVars(metadata.authProviderId),
+  };
+}
+
+function listAutoSelectMemoryEmbeddingProviderDoctorMetadata(): Array<
+  MemoryEmbeddingProviderDoctorMetadata & { envVars: string[] }
+> {
+  return BUNDLED_MEMORY_EMBEDDING_PROVIDER_DOCTOR_METADATA.filter(
+    (provider) => typeof provider.autoSelectPriority === "number",
+  )
+    .toSorted((a, b) => (a.autoSelectPriority ?? 0) - (b.autoSelectPriority ?? 0))
+    .map((provider) => ({
+      providerId: provider.providerId,
+      authProviderId: provider.authProviderId,
+      transport: provider.transport,
+      autoSelectPriority: provider.autoSelectPriority,
+      envVars: getProviderEnvVars(provider.authProviderId),
+    }));
+}
+
+function resolveSuggestedRemoteMemoryProvider(): string | undefined {
+  return listAutoSelectMemoryEmbeddingProviderDoctorMetadata().find(
+    (provider) => provider.transport === "remote",
+  )?.providerId;
+}
 
 async function resolveRuntimeMemoryAuditContext(
   cfg: OpenClawConfig,
@@ -143,6 +230,36 @@ export async function maybeRepairMemoryRecallHealth(params: {
   prompter: DoctorPrompter;
 }): Promise<void> {
   try {
+    const agentId = resolveDefaultAgentId(params.cfg);
+    const configuredWorkspaceDir = resolveAgentWorkspaceDir(params.cfg, agentId);
+    const rootMemoryFiles = await detectRootMemoryFiles(configuredWorkspaceDir);
+    if (rootMemoryFiles.canonicalExists && rootMemoryFiles.legacyExists) {
+      const approvedLegacyMigration = await params.prompter.confirmRuntimeRepair({
+        message:
+          "Merge legacy root memory.md into canonical MEMORY.md and remove the shadowed file?",
+        initialValue: true,
+      });
+      if (approvedLegacyMigration) {
+        const migration = await migrateLegacyRootMemoryFile(configuredWorkspaceDir);
+        if (migration.changed) {
+          const lines = [
+            "Workspace memory root merged:",
+            `- canonical: ${migration.canonicalPath}`,
+            migration.archivedLegacyPath ? `- backup: ${migration.archivedLegacyPath}` : null,
+            migration.mergedLegacy ? `- merged legacy content from: ${migration.legacyPath}` : null,
+            migration.removedLegacy
+              ? `- removed legacy file: ${migration.legacyPath}`
+              : `- legacy file still present: ${migration.legacyPath}`,
+          ].filter(Boolean);
+          note(lines.join("\n"), "Doctor changes");
+        }
+      }
+    }
+  } catch (err) {
+    note(`Workspace memory repair could not be completed: ${formatErrorMessage(err)}`, "Doctor");
+  }
+
+  try {
     const context = await resolveRuntimeMemoryAuditContext(params.cfg);
     const workspaceDir = context?.workspaceDir?.trim();
     if (!workspaceDir) {
@@ -232,6 +349,11 @@ export async function noteMemorySearchHealth(
 ): Promise<void> {
   const agentId = resolveDefaultAgentId(cfg);
   const agentDir = resolveAgentDir(cfg, agentId);
+  const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
+  const rootMemoryWarning = formatRootMemoryFilesWarning(await detectRootMemoryFiles(workspaceDir));
+  if (rootMemoryWarning) {
+    note(rootMemoryWarning, "Workspace memory");
+  }
   const resolved = resolveMemorySearchConfig(cfg, agentId);
   const hasRemoteApiKey = hasConfiguredMemorySecretInput(resolved?.remote?.apiKey);
 
@@ -373,7 +495,7 @@ export async function noteMemorySearchHealth(
   if (hasLocalEmbeddings(resolved.local)) {
     return;
   }
-  const autoSelectProviders = listBuiltinAutoSelectMemoryEmbeddingProviderDoctorMetadata().filter(
+  const autoSelectProviders = listAutoSelectMemoryEmbeddingProviderDoctorMetadata().filter(
     (provider) => provider.transport === "remote",
   );
   for (const provider of autoSelectProviders) {
@@ -450,10 +572,20 @@ async function hasApiKeyForProvider(
   cfg: OpenClawConfig,
   agentDir: string,
 ): Promise<boolean> {
-  const metadata = getBuiltinMemoryEmbeddingProviderDoctorMetadata(provider);
+  const metadata = resolveMemoryEmbeddingProviderDoctorMetadata(provider);
+  const authProviderId = metadata?.authProviderId ?? provider;
+  if (
+    resolveEnvApiKey(authProviderId) ||
+    resolveUsableCustomProviderApiKey({ cfg, provider: authProviderId })
+  ) {
+    return true;
+  }
+  if (authProviderId !== "amazon-bedrock" && !hasAnyAuthProfileStoreSource(agentDir)) {
+    return false;
+  }
   try {
     await resolveApiKeyForProvider({
-      provider: metadata?.authProviderId ?? provider,
+      provider: authProviderId,
       cfg,
       agentDir,
     });
@@ -464,7 +596,7 @@ async function hasApiKeyForProvider(
 }
 
 function resolvePrimaryMemoryProviderEnvVar(provider: string): string {
-  const metadata = getBuiltinMemoryEmbeddingProviderDoctorMetadata(provider);
+  const metadata = resolveMemoryEmbeddingProviderDoctorMetadata(provider);
   return metadata?.envVars[0] ?? `${provider.toUpperCase()}_API_KEY`;
 }
 
